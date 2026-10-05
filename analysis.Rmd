@@ -1,0 +1,469 @@
+---
+title: "Do Digital Nudges Survive Complexity? Analysis Code"
+output: html_document
+---
+
+```{r setup, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA)
+options(width = 140)
+suppressPackageStartupMessages({ library(sandwich); library(lmtest); library(nnet) })
+
+load(file.path("data", "cleaned_data.rda"))   # wide, long (from data_cleaning.R)
+
+bhs  <- c("BUY", "HOLD", "SELL")
+arms <- c(NO_AI = "No AI", NEUTRAL_AI = "Neutral AI", BIASED_AI = "Biased AI", DEBIASED_AI = "Debiasing AI")
+star <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "***", ifelse(p < .01, "**",
+                    ifelse(p < .05, "*", ifelse(p < .1, ".", "")))))
+clp  <- function(fit, cluster) coeftest(fit, vcov = vcovCL, cluster = cluster)
+num_sum <- function(x) { x <- suppressWarnings(as.numeric(x)); x <- x[is.finite(x)]
+  c(Mean = mean(x), Median = median(x), SD = sd(x), Min = min(x), Max = max(x),
+    IQR = as.numeric(diff(quantile(x, c(.25, .75)))), n = length(x)) }
+
+# participant covariates used in the regressions
+cov <- data.frame(participant_id = wide$participant_id, risk = wide$risk_tolerance,
+                  chartc = wide$chart_comfort, invested = ifelse(wide$investment_exp == "Yes", "Yes", "No"))
+```
+
+# 3. Experimental Design
+
+## 3.2 Sample and Recruitment
+
+```{r sample-quality}
+data.frame(Measure = c("Participants", "Completed all rounds and the closing questionnaire",
+                       "Completed round 5, skipped the closing questionnaire", "Stopped after round 4",
+                       "Experimental rounds", "Time Limit rounds with an expired timer (scored as Hold)",
+                       "Passed the Hold attention item", "Passed all three checks",
+                       "Quality score 80 or above", "Quality score 75 to 79"),
+           Value = c(nrow(wide), sum(wide$completed), sum(!wide$completed & !is.na(wide$round5_action)),
+                     sum(is.na(wide$round5_action)), nrow(long), sum(long$timed_out),
+                     sum(wide$attn_hold_pass), sum(wide$n_attn_passed == 3),
+                     sum(wide$quality_score >= 80), sum(wide$quality_score >= 75 & wide$quality_score < 80)))
+```
+
+# 4. Empirical Results
+
+## 4.1 Sample Overview, Balance Verification and Engagement
+
+### Table 2: Sample Baseline Characteristics and Randomization Balance
+
+```{r table2}
+ai_f <- factor(wide$session_ai_condition, levels = names(arms))
+fmtp <- function(p) if (p < .001) "<.001" else sprintf("%.3f", p)
+num_row <- function(label, x) {
+  per <- tapply(x, ai_f, function(v) sprintf("%.1f (%.1f)", mean(v, na.rm = TRUE), sd(v, na.rm = TRUE)))
+  data.frame(Characteristic = label, Overall = sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)),
+             t(per), p = fmtp(summary(aov(x ~ ai_f))[[1]][["Pr(>F)"]][1]), check.names = FALSE) }
+pct_row <- function(label, ind) {
+  per <- tapply(ind, ai_f, function(v) sprintf("%.0f%%", 100 * mean(v)))
+  data.frame(Characteristic = label, Overall = sprintf("%.0f%%", 100 * mean(ind)), t(per),
+             p = fmtp(suppressWarnings(chisq.test(table(ind, ai_f))$p.value)), check.names = FALSE) }
+t2 <- rbind(
+  num_row("Age (years, band midpoint), M (SD)", wide$age_num),
+  pct_row("Female, %", wide$gender %in% "Female"),
+  pct_row("Postgraduate (Master's/PhD), %", wide$education %in% c("Master's", "PhD")),
+  pct_row("Business/Economics or STEM, %", wide$field %in% c("Business / Economics", "STEM")),
+  pct_row("Employed / self-employed, %", wide$employment %in% c("Employed", "Self-employed / Business owner")),
+  pct_row("Invested before, %", wide$investment_exp == "Yes"),
+  num_row("Chart comfort (1-5), M (SD)", wide$chart_comfort),
+  num_row("Risk tolerance (1-5), M (SD)", wide$risk_tolerance),
+  num_row("Preference for quick decisions (1-5), M (SD)", wide$quick_decisions))
+names(t2)[3:6] <- arms
+table(ai_f)
+t2
+```
+
+### Decision Times and Engagement (Figure 2)
+
+```{r engagement}
+nt <- long[long$condition != "time_limit", ]          # Time Limit rounds: 15-second timer, assistant disabled
+c(median_round = median(nt$decision_sec, na.rm = TRUE),
+  median_with_ai_query = median(nt$decision_sec[nt$asked_ai_round], na.rm = TRUE),
+  median_without_ai_query = median(nt$decision_sec[!nt$asked_ai_round], na.rm = TRUE))
+
+# per-participant median decision time by AI group (Figure 2b)
+pp <- aggregate(decision_sec ~ participant_id + ai_condition, nt, median)
+tapply(pp$decision_sec, pp$ai_condition, median)
+kruskal.test(decision_sec ~ ai_condition, pp)$p.value
+pairwise.wilcox.test(pp$decision_sec, pp$ai_condition, p.adjust.method = "BH")
+
+# by round, assistant vs no assistant (Figure 2a)
+nt$grp <- ifelse(nt$ai_condition == "NO_AI", "No AI", "AI assistant")
+fr <- aggregate(cbind(median_sec = decision_sec) ~ grp + round, nt[is.finite(nt$decision_sec), ], median)
+fr$hold_share   <- aggregate(action == "HOLD" ~ grp + round, nt[is.finite(nt$decision_sec), ], mean)[, 3]
+fr$target_share <- aggregate(on_target ~ grp + round, nt[is.finite(nt$decision_sec), ], mean)[, 3]
+fr$ai_query     <- aggregate(asked_ai_round ~ grp + round, nt[is.finite(nt$decision_sec), ], mean)[, 3]
+fr[order(fr$grp, fr$round), ]
+
+# session duration (minutes): overall and by AI group
+median(wide$completion_time_min, na.rm = TRUE)
+tapply(wide$completion_time_min, wide$session_ai_condition, median, na.rm = TRUE)
+
+# in-task confidence and AI attitudes
+colMeans(wide[c("round2_confidence", "round4_confidence")], na.rm = TRUE)
+colMeans(wide[c("ai_trust", "ai_predictable", "ai_comfort")], na.rm = TRUE)
+
+# baseline-round choice shares (%)
+round(100 * prop.table(table(factor(wide$baseline_action, levels = bhs))), 1)
+```
+
+## 4.2 Primary Effects of Visual Nudges on Target Choices
+
+### Equation 2 and Table 3
+
+```{r table3}
+# each version is compared with the same participants' baseline round, both scored
+# against the version's target action; decoy: target set vs control set (outcome Buy)
+var_of <- list(framing_text   = c(up = "framing70",     down = "framing30"),
+               framing_visual = c(up = "framinggreen",  down = "framingred"),
+               rare_event     = c(up = "scarcityInc",   down = "scarcityDec"),
+               herd           = c(up = "herdbuy",       down = "herdsell"),
+               anchoring      = c(up = "anchoringhigh", down = "anchoringlow"))
+single <- c("middle", "status_quo", "time_limit")
+hits_target <- function(action, target) as.integer(!is.na(target) & !is.na(action) &
+  (action == target | (target == "BUY_SELL" & action %in% c("BUY", "SELL"))))
+own <- function(v, d, tgt) rbind(
+  data.frame(pid = d$participant_id, v = v, k = 1L, y = hits_target(d$action, tgt)),
+  data.frame(pid = d$participant_id, v = v, k = 0L, y = hits_target(d$baseline_action, tgt)))
+CS <- list()
+for (c in names(var_of)) for (dir in c("up", "down")) { e <- var_of[[c]][[dir]]
+  d <- long[long$experiment == e & long$action %in% bhs & !is.na(long$baseline_action), ]
+  CS[[e]] <- own(e, d, if (dir == "up") "BUY" else "SELL") }
+for (c in single) { d <- long[long$condition == c & !is.na(long$baseline_action), ]
+  CS[[c]] <- own(c, d, as.character(d$target)) }
+dz <- long[long$condition %in% c("decoy_no", "decoy_yes") & long$action %in% bhs, ]
+CS[["decoy"]] <- data.frame(pid = dz$participant_id, v = "decoy",
+                            k = as.integer(dz$condition == "decoy_yes"), y = as.integer(dz$action == "BUY"))
+CC <- merge(do.call(rbind, CS), cov, by.x = "pid", by.y = "participant_id", all.x = TRUE)
+CC$v <- factor(CC$v, levels = names(CS))
+
+# column (1): each contrast on its own
+c1 <- do.call(rbind, lapply(names(CS), function(v) { ct <- clp(lm(y ~ k, CS[[v]]), ~pid)
+  data.frame(version = v, est = 100 * ct["k", 1], se = 100 * ct["k", 2], p = ct["k", 4],
+             n = length(unique(CS[[v]]$pid[CS[[v]]$k == 1]))) }))
+# column (2): one stacked model with contrast-specific intercepts and effects, shared covariates
+m2 <- lm(y ~ 0 + v + v:k + risk + chartc + invested, CC); c2 <- clp(m2, ~pid)
+k2 <- paste0("v", c1$version, ":k")
+t3 <- data.frame(Version = c1$version,
+                 `(1)` = sprintf("%.1f%s", c1$est, star(c1$p)), SE1 = sprintf("(%.1f)", c1$se),
+                 `(2)` = sprintf("%.1f%s", 100 * c2[k2, 1], star(c2[k2, 4])), SE2 = sprintf("(%.1f)", 100 * c2[k2, 2]),
+                 n = c1$n, check.names = FALSE)
+t3
+c(decoy_target_set = sum(dz$condition == "decoy_yes"), decoy_control_set = sum(dz$condition == "decoy_no"))
+
+# Panel C: shared covariates, column (2)
+cv <- c("risk", "chartc", "investedYes")
+data.frame(Term = c("Risk tolerance (1-5)", "Chart comfort (1-5)", "Invested before (Yes)"),
+           Estimate = sprintf("%.1f%s", 100 * c2[cv, 1], star(c2[cv, 4])), SE = sprintf("%.1f", 100 * c2[cv, 2]))
+c(contrasts = length(CS), participants = length(unique(CC$pid)), stacked_observations = nobs(m2))
+```
+
+### Figure 3a: 90% and 95% Confidence Intervals
+
+```{r fig3a}
+f3a <- transform(c1, lo90 = est - 1.645 * se, hi90 = est + 1.645 * se, lo95 = est - 1.96 * se, hi95 = est + 1.96 * se)
+f3a[, -1] <- round(f3a[, -1], 3)
+f3a
+c(ci90_includes_zero = sum(f3a$lo90 <= 0 & f3a$hi90 >= 0), ci95_excludes_zero = sum(f3a$lo95 > 0 | f3a$hi95 < 0))
+```
+
+## 4.3 AI Assistance as a Choice Architecture Moderator
+
+### Equation 3 and Table 4
+
+```{r table4}
+d <- long[long$condition != "time_limit" & long$action %in% bhs, ]
+d <- merge(d, cov, by = "participant_id", all.x = TRUE)
+d$ai <- relevel(factor(d$ai_condition), ref = "NO_AI")
+dp <- d[d$condition != "status_quo", ]                 # Time Limit and Inaction Friction excluded
+m1 <- clp(lm(on_target ~ ai + factor(experiment), dp), dp$participant_id)
+m2 <- clp(lm(on_target ~ ai + factor(experiment) + risk + chartc + invested, dp), dp$participant_id)
+og <- clp(glm(on_target ~ ai + factor(experiment), binomial, dp), dp$participant_id)
+ppci <- function(ct, k) sprintf("%.1f%s [%.1f, %.1f]", 100 * ct[k, 1], star(ct[k, 4]),
+                                100 * (ct[k, 1] - 1.96 * ct[k, 2]), 100 * (ct[k, 1] + 1.96 * ct[k, 2]))
+orci <- function(ct, k) sprintf("%.2f [%.2f, %.2f]", exp(ct[k, 1]), exp(ct[k, 1] - 1.96 * ct[k, 2]), exp(ct[k, 1] + 1.96 * ct[k, 2]))
+ks <- paste0("ai", c("NEUTRAL_AI", "BIASED_AI", "DEBIASED_AI"))
+data.frame(AI = arms[-1], `(1) pp [95% CI]` = ppci(m1, ks), `(2) + covariates` = ppci(m2, ks),
+           `Odds ratio [95% CI]` = orci(og, ks), check.names = FALSE)
+nrow(dp)
+
+# raw share of target-action choices by AI group (%)
+round(100 * tapply(dp$on_target, dp$ai_condition, mean), 1)
+```
+
+### Figure 3b: Biased AI vs No AI by Condition
+
+```{r fig3b}
+cs <- c("decoy_no", "decoy_yes", "middle", "rare_event", "framing_text", "framing_visual", "herd", "anchoring")
+f3b <- do.call(rbind, lapply(cs, function(cn) { dc <- d[d$condition == cn, ]
+  f <- if (nlevels(droplevels(dc$experiment)) > 1) on_target ~ ai + factor(experiment) else on_target ~ ai
+  ct <- clp(lm(f, dc), dc$participant_id)
+  data.frame(condition = cn, est = 100 * ct["aiBIASED_AI", 1], se = 100 * ct["aiBIASED_AI", 2],
+             p = ct["aiBIASED_AI", 4], n = sum(dc$ai %in% c("NO_AI", "BIASED_AI"))) }))
+f3b <- transform(f3b, lo95 = est - 1.96 * se, hi95 = est + 1.96 * se)
+f3b[, -1] <- round(f3b[, -1], 3); f3b
+
+# rounds per direction (biased and no-assistant groups)
+sapply(unlist(var_of), function(e) sum(d$experiment == e & d$ai %in% c("NO_AI", "BIASED_AI")))
+```
+
+## 4.4 Decomposing the Nudge Effects
+
+### Equation 4 and Table 5
+
+```{r table5}
+mnud <- long[long$action %in% bhs, c("participant_id", "experiment", "action")]
+names(mnud)[2] <- "version"
+mbas <- data.frame(participant_id = wide$participant_id, version = "baseline", action = wide$baseline_action)
+MM <- rbind(mnud, mbas)
+MM$action  <- relevel(factor(MM$action), ref = "HOLD")
+MM$version <- relevel(factor(MM$version), ref = "baseline")
+mfit <- multinom(action ~ version, MM, trace = FALSE); mcf <- coef(mfit)
+
+# participant-clustered bootstrap (participants resampled)
+set.seed(20261005); B <- 999
+ids <- unique(MM$participant_id); byid <- split(seq_len(nrow(MM)), MM$participant_id)
+boot <- replicate(B, { s <- sample(ids, length(ids), replace = TRUE)
+  bm <- MM[unlist(byid[s], use.names = FALSE), ]
+  f <- tryCatch(multinom(action ~ version, bm, trace = FALSE, maxit = 500), error = function(e) NULL)
+  if (is.null(f) || !identical(dim(coef(f)), dim(mcf))) matrix(NA, nrow(mcf), ncol(mcf)) else coef(f) }, simplify = "array")
+mse <- apply(boot, c(1, 2), sd, na.rm = TRUE); dimnames(mse) <- dimnames(mcf)
+mp  <- 2 * (1 - pnorm(abs(mcf / mse)))
+vers <- c("framing70", "framing30", "framinggreen", "framingred", "scarcityInc", "scarcityDec", "herdbuy", "herdsell",
+          "anchoringhigh", "anchoringlow", "decoyNo", "decoyYes", "middle", "statusquo", "timelimit")
+kv <- paste0("version", vers)
+data.frame(Version = vers,
+           `Buy vs Hold (OR)`  = sprintf("%.2f%s", exp(mcf["BUY", kv]),  star(mp["BUY", kv])),
+           `Sell vs Hold (OR)` = sprintf("%.2f%s", exp(mcf["SELL", kv]), star(mp["SELL", kv])),
+           `p Buy` = round(mp["BUY", kv], 3), `p Sell` = round(mp["SELL", kv], 3), check.names = FALSE)
+c(decisions = nrow(MM), participants = length(ids), replicates = sum(!is.na(boot[1, 1, ])))
+```
+
+### Choice Shares by Version (Decoy and Middle Option)
+
+```{r shares}
+shares <- function(e) { x <- long$action[long$experiment == e]
+  c(n = length(x), Buy = 100 * mean(x == "BUY"), Hold = 100 * mean(x == "HOLD"), Sell = 100 * mean(x == "SELL")) }
+round(t(sapply(c(vers[1:13]), shares)), 1)
+```
+
+# 5. Robustness and Heterogeneity Analysis
+
+## 5.1 Treatment Effect Heterogeneity
+
+### 5.1.1 Heterogeneity by Individual Differences (Table A6)
+
+```{r tableA6}
+# trait groups (group 1 vs group 0), all reported before the task
+pm <- data.frame(participant_id = wide$participant_id,
+  invested = as.integer(wide$investment_exp == "Yes"),
+  news_hi  = as.integer(wide$news_frequency %in% c("Daily", "Weekly", "Monthly")),
+  risk_hi  = as.integer(wide$risk_tolerance  >= 4),
+  chart_hi = as.integer(wide$chart_comfort   >= 4),
+  quick_hi = as.integer(wide$quick_decisions >= 4),
+  risk = wide$risk_tolerance, chartc = wide$chart_comfort,
+  trust = wide$ai_trust, pred = wide$ai_predictable, comf = wide$ai_comfort,
+  eng = wide$total_ai_requests, aic = wide$session_ai_condition)
+MODS <- c("invested", "news_hi", "risk_hi", "chart_hi", "quick_hi")
+sapply(pm[MODS], function(m) c(n = sum(m), pct = round(100 * mean(m))))
+
+CH <- merge(CC[, c("pid", "v", "k", "y")], pm[, c("participant_id", MODS)], by.x = "pid", by.y = "participant_id")
+hz <- do.call(rbind, lapply(levels(CC$v), function(v) do.call(rbind, lapply(MODS, function(m) {
+  s <- CH[CH$v == v, ]; s$m <- s[[m]]; ct <- clp(lm(y ~ k * m, s), s$pid)
+  data.frame(effect = v, trait = m, est = 100 * ct["k:m", 1], se = 100 * ct["k:m", 2], p = ct["k:m", 4], n_obs = nrow(s)) }))))
+
+# biased AI x trait, in the Table 4 column (1) model
+ai <- long[!(long$condition %in% c("time_limit", "status_quo")) & long$action %in% bhs, ]
+ai <- merge(ai, pm, by = "participant_id", all.x = TRUE)
+ai$ai <- relevel(factor(ai$ai_condition), ref = "NO_AI")
+ha <- do.call(rbind, lapply(MODS, function(m) { a <- ai; a$m <- a[[m]]
+  ct <- clp(lm(on_target ~ ai * m + factor(experiment), a), a$participant_id)
+  data.frame(effect = "biased_ai", trait = m, est = 100 * ct["aiBIASED_AI:m", 1], se = 100 * ct["aiBIASED_AI:m", 2],
+             p = ct["aiBIASED_AI:m", 4], n_obs = nrow(a)) }))
+H <- rbind(hz, ha)
+H$q_BH <- p.adjust(H$p, "BH")
+H$cell <- sprintf("%.1f%s", H$est, star(H$p))
+tA6 <- reshape(H[, c("effect", "trait", "cell")], idvar = "effect", timevar = "trait", direction = "wide")
+tA6
+unique(H[, c("effect", "n_obs")])
+c(interactions = nrow(H), p_below_05 = sum(H$p < .05), expected_by_chance = .05 * nrow(H),
+  q_below_05 = sum(H$q_BH < .05), smallest_q = round(min(H$q_BH), 3))
+H[order(H$p)[1:5], ]
+```
+
+### 5.1.2 Susceptibility to AI Assistance (Table 6)
+
+```{r table6}
+# moderators standardized across participants in the assistant groups
+onai <- pm$aic != "NO_AI"
+for (m in c("trust", "pred", "comf", "eng")) { z <- rep(NA_real_, nrow(pm))
+  z[onai] <- (pm[[m]][onai] - mean(pm[[m]][onai], na.rm = TRUE)) / sd(pm[[m]][onai], na.rm = TRUE)
+  ai[[paste0("z_", m)]] <- z[match(ai$participant_id, pm$participant_id)] }
+at <- ai[ai$ai_condition != "NO_AI", ]
+at$ai <- relevel(droplevels(factor(at$ai_condition)), ref = "BIASED_AI")
+ppse <- function(ct, k) sprintf("%.1f%s (%.1f)", 100 * ct[k, 1], star(ct[k, 4]), 100 * ct[k, 2])
+do.call(rbind, lapply(c("trust", "pred", "comf", "eng"), function(m) {
+  a <- at; a$z <- a[[paste0("z_", m)]]; a <- a[!is.na(a$z), ]
+  ct <- clp(lm(on_target ~ ai * z + factor(experiment), a), a$participant_id)
+  data.frame(Moderator = m, `Biased: slope` = ppse(ct, "z"), `Debiasing x moderator` = ppse(ct, "aiDEBIASED_AI:z"),
+             `Neutral x moderator` = ppse(ct, "aiNEUTRAL_AI:z"), Participants = length(unique(a$participant_id)),
+             Decisions = nrow(a), check.names = FALSE) }))
+```
+
+## 5.2 Methodological Robustness and Sensitivity Checks
+
+### 5.2.1 Alternative Econometric Specifications (Table A7)
+
+```{r tableA7}
+# same specification as LPM, logit, and probit; average marginal effects with
+# participant-clustered delta-method standard errors
+ame_dm <- function(fit, rows, d1, d0, V) {
+  tt <- delete.response(terms(fit)); b <- coef(fit); ok <- !is.na(b)
+  X1 <- model.matrix(tt, d1[rows, ], xlev = fit$xlevels)[, ok, drop = FALSE]
+  X0 <- model.matrix(tt, d0[rows, ], xlev = fit$xlevels)[, ok, drop = FALSE]
+  if (inherits(fit, "glm")) { li <- fit$family$linkinv; me <- fit$family$mu.eta
+    e1 <- drop(X1 %*% b[ok]); e0 <- drop(X0 %*% b[ok])
+    est <- mean(li(e1) - li(e0)); g <- colMeans(me(e1) * X1 - me(e0) * X0)
+  } else { est <- mean(drop((X1 - X0) %*% b[ok])); g <- colMeans(X1 - X0) }
+  se <- sqrt(drop(t(g) %*% V[ok, ok] %*% g)); c(est = 100 * est, se = 100 * se, p = 2 * pnorm(-abs(est / se))) }
+fmt <- function(r) sprintf("%.1f%s (%.1f)", r[["est"]], star(r[["p"]]), r[["se"]])
+
+# nudge effects: Table 3, column (2)
+fn <- y ~ 0 + v + v:k + risk + chartc + invested
+fits <- list(LPM = lm(fn, CC), Logit = glm(fn, binomial("logit"), CC), Probit = glm(fn, binomial("probit"), CC))
+C1 <- CC; C1$k <- 1L; C0 <- CC; C0$k <- 0L
+a7n <- do.call(rbind, lapply(levels(CC$v), function(v) { rows <- which(CC$v == v)
+  r <- sapply(fits, function(f) fmt(ame_dm(f, rows, C1, C0, vcovCL(f, cluster = CC$pid))))
+  data.frame(Effect = v, t(r), N = length(rows)) }))
+
+# AI effects: Table 4, column (2)
+fa <- on_target ~ ai + factor(experiment) + risk + chartc + invested
+afits <- list(LPM = lm(fa, ai), Logit = glm(fa, binomial("logit"), ai), Probit = glm(fa, binomial("probit"), ai))
+A0 <- ai; A0$ai <- factor("NO_AI", levels = levels(ai$ai))
+a7a <- do.call(rbind, lapply(c("NEUTRAL_AI", "BIASED_AI", "DEBIASED_AI"), function(g) {
+  A1 <- ai; A1$ai <- factor(g, levels = levels(ai$ai))
+  r <- sapply(afits, function(f) fmt(ame_dm(f, seq_len(nrow(ai)), A1, A0, vcovCL(f, cluster = ai$participant_id))))
+  data.frame(Effect = g, t(r), N = nrow(ai)) }))
+rbind(a7n, a7a)
+
+# fitted values of the linear probability models
+fitted_all <- c(fitted(lm(y ~ 0 + v + v:k, CC)), fitted(lm(y ~ 0 + v + v:k + risk + chartc + invested, CC)),
+                fitted(lm(on_target ~ ai_condition + factor(experiment), dp)),
+                fitted(lm(on_target ~ ai_condition + factor(experiment) + risk + chartc + invested, dp)))
+round(range(fitted_all), 2)
+```
+
+### 5.2.2 Round Order and Carry-Over Effects
+
+```{r round-order}
+ord <- long[long$condition != "time_limit", ]
+ct <- clp(lm(on_target ~ factor(condition) + round, ord), ord$participant_id)
+c(pp_per_round = 100 * ct["round", 1], se = 100 * ct["round", 2], p = ct["round", 4], decisions = nrow(ord))
+
+# final round among participants whose block did not include the time limit
+has_tl <- tapply(long$condition == "time_limit", long$participant_id, any)
+fr5 <- long[long$participant_id %in% names(which(!has_tl)), ]
+fr5$r5 <- as.integer(fr5$round == 5); fr5$active <- as.integer(fr5$action %in% c("BUY", "SELL"))
+o2 <- clp(lm(active ~ factor(condition) + r5, fr5), fr5$participant_id)
+c(participants = length(unique(fr5$participant_id)), pp_round5_active = 100 * o2["r5", 1], p = o2["r5", 4])
+```
+
+# 6. Discussion
+
+## 6.1 Inaction Friction by AI Group
+
+```{r inaction-friction}
+sq <- CC[CC$v == "status_quo", ]
+sq$ai <- wide$session_ai_condition[match(sq$pid, wide$participant_id)]
+if_eff <- function(s) { ct <- clp(lm(y ~ k, s), s$pid)
+  c(pp = 100 * ct["k", 1], se = 100 * ct["k", 2], p = ct["k", 4], participants = sum(s$k == 1)) }
+rbind(all = if_eff(sq), biased_ai = if_eff(sq[sq$ai == "BIASED_AI", ]),
+      other_groups = if_eff(sq[sq$ai != "BIASED_AI", ]))
+```
+
+# Appendix B. Baseline Choice versus Nudge-Round Choice (Table A1)
+
+```{r tableA1}
+for (e in c("framing70", "framing30", "framinggreen", "framingred", "scarcityInc", "scarcityDec", "decoyYes", "decoyNo")) {
+  dd <- long[long$experiment == e, ]
+  cat("\n", e, "\n"); print(addmargins(table(baseline = factor(dd$baseline_action, levels = bhs),
+                                             nudge = factor(dd$action, levels = bhs)), 2)) }
+```
+
+# Appendix C. Experimental Randomization Protocol and BIBD Parameters (Table A2)
+
+```{r tableA2}
+cond_order <- c("decoy_no", "decoy_yes", "middle", "rare_event", "framing_text", "framing_visual", "herd",
+                "anchoring", "status_quo", "time_limit")
+addmargins(table(factor(long$condition, levels = cond_order), factor(long$ai_condition, levels = names(arms))), 2)
+
+sets <- tapply(as.character(long$condition), long$participant_id, function(x) paste(sort(unique(x)), collapse = "+"))
+full <- sets[lengths(strsplit(sets, "[+]")) == 5]
+blk  <- table(full)
+pairs <- combn(cond_order, 2)
+shared <- apply(pairs, 2, function(p) sum(vapply(strsplit(full, "[+]"), function(s) all(p %in% s), logical(1))))
+c(blocks = length(blk), participants_per_block_min = min(blk), participants_per_block_max = max(blk),
+  blocks_with_13 = sum(blk == 13), pair_participants_min = min(shared), pair_participants_max = max(shared))
+```
+
+# Appendix E. Sample Characteristics, Decision Times, and Process Measures
+
+### Table A3
+
+```{r tableA3}
+blockc <- function(vec, levels) { k <- vapply(levels, function(l) sum(vec == l, na.rm = TRUE), integer(1))
+  data.frame(Category = levels, N = k, Pct = round(100 * k / length(vec), 1), row.names = NULL) }
+blockc(wide$age_grp, c("18-24", "25-34", "35-44", "45+"))
+blockc(wide$gender, c("Female", "Male", "Prefer not to say"))
+blockc(wide$nationality_grp, c("Armenian", "Other"))
+blockc(wide$education_grp, c("High school or Bachelor's", "Master's", "PhD"))
+blockc(wide$field, c("STEM", "Business / Economics", "Social Sciences", "Arts / Humanities", "Other"))
+blockc(wide$employment, c("Bachelor/Master student", "PhD student", "Researcher / Lecturer", "Employed",
+                          "Self-employed / Business owner", "Unemployed", "Other"))
+blockc(wide$investment_exp, c("Yes", "No"))
+blockc(wide$news_frequency, c("Daily", "Weekly", "Monthly", "Rarely", "Never"))
+vars <- c("years_investing", "risk_tolerance", "chart_comfort", "quick_decisions", "round2_confidence",
+          "round4_confidence", "ai_trust", "ai_predictable", "ai_comfort")
+t(sapply(vars, function(v) { s <- num_sum(wide[[v]]); c(Mean = round(s[["Mean"]], 2), SD = round(s[["SD"]], 2), n = s[["n"]]) }))
+```
+
+### Table A4
+
+```{r tableA4}
+round(rbind(
+  `Total session duration (min)`     = num_sum(wide$completion_time_min),
+  `Baseline decision (s)`            = num_sum(wide$baseline_sec),
+  `Treatment-round decision (s)`     = num_sum(nt$decision_sec),
+  `  rounds with an AI query (s)`    = num_sum(nt$decision_sec[nt$asked_ai_round]),
+  `  rounds without an AI query (s)` = num_sum(nt$decision_sec[!nt$asked_ai_round]),
+  `AI messages per session (count)`  = num_sum(wide$total_ai_requests),
+  do.call(rbind, lapply(setNames(names(arms), paste("Session duration (min),", arms)),
+                        function(a) num_sum(wide$completion_time_min[wide$session_ai_condition == a])))), 1)
+```
+
+### Process Measures by AI Group
+
+```{r process}
+pmed <- tapply(nt$decision_sec, nt$participant_id, median, na.rm = TRUE)
+parm <- factor(wide$session_ai_condition[match(names(pmed), wide$participant_id)], levels = names(arms))
+conf <- rowMeans(cbind(wide$round2_confidence, wide$round4_confidence), na.rm = TRUE)
+tr   <- wide$ai_trust; sub <- ai_f != "NO_AI"
+rbind(median_decision_sec = tapply(pmed, parm, median, na.rm = TRUE),
+      mean_confidence     = tapply(conf, ai_f, mean, na.rm = TRUE),
+      mean_trust          = tapply(tr, ai_f, mean, na.rm = TRUE))
+c(kruskal_decision_time = kruskal.test(pmed ~ parm)$p.value,
+  anova_confidence      = summary(aov(conf ~ ai_f))[[1]][["Pr(>F)"]][1],
+  anova_trust           = summary(aov(tr[sub] ~ droplevels(ai_f[sub])))[[1]][["Pr(>F)"]][1])
+
+# biased vs neutral and biased vs debiasing: Welch t-test and Wilcoxon rank-sum, Holm-adjusted
+pw <- sapply(c("NEUTRAL_AI", "DEBIASED_AI"), function(a) { x <- tr[ai_f == "BIASED_AI"]; y <- tr[ai_f == a]
+  c(welch = t.test(x, y)$p.value, wilcoxon = suppressWarnings(wilcox.test(x, y, exact = FALSE)$p.value)) })
+rbind(welch_holm = p.adjust(pw["welch", ], "holm"), wilcoxon_holm = p.adjust(pw["wilcoxon", ], "holm"))
+```
+
+# Appendix F. Directional Asymmetry of the Paired Nudges (Table A5)
+
+```{r tableA5}
+tA5 <- cbind(round(t(sapply(unlist(var_of), shares)), 1),
+             f3a[match(unlist(var_of), f3a$version), c("est", "lo95", "hi95", "p")])
+tA5
+```
