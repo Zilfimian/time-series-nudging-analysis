@@ -1,9 +1,24 @@
 # =============================================================================
 # data_cleaning.R
-# Input : data/TS-Nudging-Data.xlsx  (raw survey export, sheet "Sheet1")
+# Input : data/TS-Nudging-Data.xlsx  (shared data file, sheet "Sheet1",
+#                                     one row per participant)
 # Output: data/cleaned_data.rda      (objects: wide, long)
 #   wide : one row per participant
 #   long : one row per participant x experimental round
+#
+# The data file contains only the survey columns used below; browser,
+# recruitment, and navigation metadata from the survey platform are not included.
+#
+# Note on the AI chat data: to protect participants' privacy, the shared data
+# file does not contain the text of the messages exchanged with the AI
+# assistant. Instead, it contains counts derived from the chat logs:
+#   round1_ai_n ... round5_ai_n : number of messages the participant sent to the
+#                                 assistant in each round
+#   ai_msg_bad    : number of messages with fewer than 5 characters or without a
+#                   word of at least two letters
+#   ai_msg_repeat : TRUE if the participant sent an identical message more than once
+# These counts define assistant use (messages per round and per session) and the
+# AI-chat component of the quality score.
 # =============================================================================
 RAW_FILE <- file.path("data", "TS-Nudging-Data.xlsx")
 OUT_FILE <- file.path("data", "cleaned_data.rda")
@@ -24,7 +39,6 @@ QSCORE_WEIGHTS <- c(attention = 0.70, comp_time = 0.10, straightline = 0.10, ai_
 FAST_THRESHOLD_MIN <- 2
 SLOW_THRESHOLD_MIN <- 60
 FAST_DECISION_SEC  <- 1.5
-AI_MSG_MIN_CHARS   <- 5
 
 # Armenian answer labels -> English
 DEMO_TRANSLATE <- list(
@@ -61,7 +75,6 @@ NUDGE_TARGET <- c(
   anchoringhigh = "BUY", anchoringlow = "SELL", timelimit = "BUY_SELL")
 
 ## ---- helpers -----------------------------------------------------------------
-`%||%` <- function(a, b) if (is.null(a)) b else a
 is_blank <- function(x) is.na(x) | !nzchar(trimws(as.character(x))) |
   toupper(trimws(as.character(x))) %in% c("NA", "NULL", "N/A") | trimws(as.character(x)) == "_"
 to_time <- function(v) { v <- as.character(v); v[is_blank(v)] <- NA
@@ -76,13 +89,6 @@ hits_target <- function(action, target) {
   action <- toupper(trimws(as.character(action))); target <- as.character(target)
   as.integer(!is.na(target) & !is.na(action) &
                (action == target | (target == "BUY_SELL" & action %in% c("BUY", "SELL")))) }
-parse_chat <- function(x, pid, r) {
-  if (is_blank(x)) return(NULL)
-  out <- tryCatch(jsonlite::fromJSON(x), error = function(e) NULL)
-  if (is.null(out) || !length(out)) return(NULL)
-  out <- as.data.frame(out, stringsAsFactors = FALSE)
-  data.frame(participant_id = pid, round = r, user_message = as.character(out$user_message %||% NA),
-             stringsAsFactors = FALSE) }
 
 ## ---- import ------------------------------------------------------------------
 raw <- as.data.frame(readxl::read_excel(RAW_FILE, sheet = "Sheet1", col_types = "text"))
@@ -134,18 +140,12 @@ for (r in ROUNDS) wide[[paste0("round", r, "_sec")]] <- secs(raw[[paste0("round"
 wide$min_decision_sec <- apply(as.matrix(wide[paste0("round", ROUNDS, "_sec")]), 1,
                                function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE))
 
-chat <- do.call(rbind, lapply(ROUNDS, function(r) do.call(rbind,
-  Map(parse_chat, raw[[paste0("round", r, "_ai_chat")]], raw$participant_id, r))))
-msg <- trimws(chat$user_message)
-chat$bad_message <- is.na(msg) | nchar(msg) < AI_MSG_MIN_CHARS | !grepl("[A-Za-zԱ-և]{2,}", msg, perl = TRUE)
-for (r in ROUNDS) wide[[paste0("round", r, "_ai_n")]] <-
-  as.integer(table(factor(chat$participant_id[chat$round == r], levels = wide$participant_id)))
+# messages sent to the AI assistant (counts from the chat logs; see the note above)
+for (r in ROUNDS) wide[[paste0("round", r, "_ai_n")]] <- as.integer(num(raw[[paste0("round", r, "_ai_n")]]))
 wide$total_ai_requests <- rowSums(wide[paste0("round", ROUNDS, "_ai_n")])
 wide$asked_ai   <- wide$total_ai_requests > 0
-wide$ai_msg_bad <- as.integer(table(factor(chat$participant_id[chat$bad_message], levels = wide$participant_id)))
-rep_any <- tapply(tolower(msg), chat$participant_id, function(m) { m <- m[!is.na(m) & nzchar(m)]
-  length(m) >= 2 && anyDuplicated(m) > 0 })
-wide$flag_ai_repeat <- wide$participant_id %in% names(rep_any)[rep_any]
+wide$ai_msg_bad <- as.integer(num(raw$ai_msg_bad))
+wide$flag_ai_repeat <- toupper(trimws(raw$ai_msg_repeat)) %in% c("TRUE", "1")
 
 ## ---- attention checks and quality score -------------------------------------
 wide$probability_check <- num(raw$probability_check)
