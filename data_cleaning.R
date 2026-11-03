@@ -139,6 +139,9 @@ entry <- c("baseline_click_time", "next_r1_click_time", "next_att_click_time",
 for (r in ROUNDS) wide[[paste0("round", r, "_sec")]] <- secs(raw[[paste0("round", r, "_time")]], raw[[entry[r]]])
 wide$min_decision_sec <- apply(as.matrix(wide[paste0("round", ROUNDS, "_sec")]), 1,
                                function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE))
+# revision: Time Limit round, seconds from timer start; date of the session
+wide$round5_reaction_time <- num(raw$round5_reaction_time)
+wide$session_date <- as.Date(to_time(raw$start_time))
 
 # messages sent to the AI assistant (counts from the chat logs; see the note above)
 for (r in ROUNDS) wide[[paste0("round", r, "_ai_n")]] <- as.integer(num(raw[[paste0("round", r, "_ai_n")]]))
